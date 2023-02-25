@@ -10,10 +10,12 @@ from typing import List, Optional
 # via github.com/openai/guided-diffusion
 # via github.com/VSehwag/minimal-diffusion/
 
+
 def zero_module(module):
     for p in module.parameters():
         p.detach().zero_()
     return module
+
 
 class CondBlock(nn.Module):
     @abstractmethod
@@ -22,7 +24,6 @@ class CondBlock(nn.Module):
 
 
 class ImageSelfAttention(nn.Module):
-
     def __init__(self, num_channels: int, num_heads: int = 4):
         super().__init__()
         self.channels = num_channels
@@ -41,6 +42,25 @@ class ImageSelfAttention(nn.Module):
         attn_output, _ = self.attn_layer(x, x, x)
         return attn_output.reshape(b, c, w, h)
     
+
+class SelfAttention2d(nn.Module):
+    def __init__(self, num_channels, num_heads=1):
+        super().__init__()
+        assert num_channels % num_heads == 0
+        self.n_head = num_heads
+        self.qkv_proj = nn.Conv2d(num_channels, num_channels * 3, 1)
+        self.out_proj = nn.Conv2d(num_channels, num_channels, 1)
+
+    def forward(self, input):
+        n, c, h, w = input.shape
+        qkv = self.qkv_proj(input)
+        qkv = qkv.view([n, self.n_head * 3, c // self.n_head, h * w]).transpose(2, 3)
+        q, k, v = qkv.chunk(3, dim=1)
+        scale = k.shape[3]**-0.25
+        att = ((q * scale) @ (k.transpose(2, 3) * scale)).softmax(3)
+        y = (att @ v).transpose(2, 3).contiguous().view([n, c, h, w])
+        return input + self.out_proj(y)
+
 
 class ConditionedSequential(nn.Sequential, CondBlock):
     def forward(self, x, temb, c):
@@ -247,6 +267,8 @@ class FourierFeatures(nn.Module):
 def expand_to_planes(input, shape):
     return input[..., None, None].repeat([1, 1, shape[2], shape[3]])
 
+
+# export types without creating a dependency on files using files using this file
 
 NormalizationLayers = {
     'groupnorm': GroupNorm,

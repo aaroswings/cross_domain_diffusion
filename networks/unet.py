@@ -8,7 +8,7 @@ from networks.resnet import (
     CondIdentity,
     ConditionedSequential,
     FourierFeatures,
-    ImageSelfAttention,
+    SelfAttention2d,
     GroupNorm,
     ResConvBlock,
     SkipBlock,
@@ -48,7 +48,7 @@ class UpDownBlock(CondBlock):
         )
         self.use_attn = attn_heads > 0
         if self.use_attn:
-            self.attn = ImageSelfAttention(out_channels, attn_heads)
+            self.attn = SelfAttention2d(out_channels, attn_heads)
 
         if updown_mode == 'down':
             self.updown = nn.AvgPool2d(2)
