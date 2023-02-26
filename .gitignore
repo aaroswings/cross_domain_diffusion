@@ -1,3 +1,4 @@
 **/__pycache__
 *.ipynb
 tester.py
+data/anime_sketch_color

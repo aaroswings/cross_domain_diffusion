@@ -23,26 +23,6 @@ class CondBlock(nn.Module):
         raise NotImplementedError
 
 
-class ImageSelfAttention(nn.Module):
-    def __init__(self, num_channels: int, num_heads: int = 4):
-        super().__init__()
-        self.channels = num_channels
-        self.heads = num_heads
-
-        self.attn_layer = nn.MultiheadAttention(num_channels, num_heads=num_heads)
-
-    def forward(self, x):
-        """
-        :param x: tensor with shape [batch_size, channels, width, height]
-        :return: the attention output applied to the image with the shape [batch_size, channels, width, height]
-        """
-        b, c, w, h = x.shape
-        x = x.reshape(b, w * h, c)
-
-        attn_output, _ = self.attn_layer(x, x, x)
-        return attn_output.reshape(b, c, w, h)
-    
-
 class SelfAttention2d(nn.Module):
     def __init__(self, num_channels, num_heads=1):
         super().__init__()
@@ -83,12 +63,13 @@ class SkipBlock(CondBlock):
         self.main = ConditionedSequential(*main)
 
     def forward(self, x, temb, c):
-        return torch.cat([x, self.main(x, temb, c)], dim=1)
+        # in skip connects, scale the skip by root(2) as in SimpleDiffusion, Imagen net
+        return x / torch.sqrt(torch.tensor(2)).to(x.device) + self.main(x, temb, c)
 
 
 class GroupNorm(CondBlock):
     def __init__(self, num_groups: int, out_dim: int, emb_dim: int,
-        actvn_type: Optional[nn.Module] = nn.SiLU, eps: float = 1e-5):
+            actvn_type: Optional[nn.Module] = nn.SiLU, eps: float = 1e-5):
         super().__init__()
         self.norm = nn.GroupNorm(num_groups, out_dim, eps, affine=True)
         self.actvn = actvn_type(inplace=True) if actvn_type is not None else nn.Identity()
@@ -154,8 +135,7 @@ class ResConvBlock(CondBlock):
             self, 
             in_channels: int, 
             out_channels: int, 
-            temb_dim: int,
-            c_dim: int,
+            emb_dim: int,
             p_dropout: float = 0.0,
             norm_in_type: CondBlock = GroupNorm, 
             norm_out_type: CondBlock = GroupNorm,
@@ -163,19 +143,8 @@ class ResConvBlock(CondBlock):
             actvn_type: nn.Module = nn.SiLU):
         super().__init__()
         # 0. Normalization layer types.
-        if norm_in_type == GroupNorm or norm_in_type == TimestepAdaGroupNorm:
-            norm_in = norm_in_type(32, in_channels, temb_dim, actvn_type)
-        elif norm_in_type == ContextAdaGroupNorm:
-            norm_in = norm_in_type(32, in_channels, c_dim, actvn_type)
-        else:
-            raise NotImplementedError("Only GroupNorm, TimestepAdaGroupNorm, or ContextAdaGroupNorm types are supported")
-
-        if norm_out_type == GroupNorm or norm_out_type == TimestepAdaGroupNorm:
-            norm_out = norm_in_type(32, out_channels, temb_dim, actvn_type)
-        elif norm_out_type == ContextAdaGroupNorm:
-            norm_out = norm_in_type(32, out_channels, c_dim, actvn_type)
-        else:
-            raise NotImplementedError("Only GroupNorm, TimestepAdaGroupNorm, or ContextAdaGroupNorm types are supported")
+        norm_in = norm_in_type(32, in_channels, emb_dim, actvn_type)
+        norm_out = norm_out_type(32, out_channels, emb_dim, actvn_type)
 
         # 1. Hidden blocks.
         self.main = ConditionedSequential(
@@ -253,6 +222,11 @@ class ConvBlock(CondBlock):
         return x
 
 
+"""
+References: 
+https://github.com/huggingface/diffusers/blob/589faa8c881de32932faebf92d2d8007135294d6/src/diffusers/models/unet_2d.py#L126
+https://github.com/crowsonkb/v-diffusion-pytorch/blob/master/diffusion/models/danbooru_128.py#L59
+"""
 class FourierFeatures(nn.Module):
     def __init__(self, in_features, out_features, std=1.):
         super().__init__()
@@ -268,8 +242,7 @@ def expand_to_planes(input, shape):
     return input[..., None, None].repeat([1, 1, shape[2], shape[3]])
 
 
-# export types without creating a dependency on files using files using this file
-
+# export types without creating an import dependency on on this file when creating objects using these modules
 NormalizationLayers = {
     'groupnorm': GroupNorm,
     'ada_groupnorm_temb': TimestepAdaGroupNorm,
