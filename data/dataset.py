@@ -66,6 +66,7 @@ class PairedDataset(Dataset):
         return x
 
 
+@torch.no_grad()
 def tensor_to_image(y: torch.Tensor) -> Image:
     y = y.cpu()
     y = torch.clamp(y, -1, 1)
@@ -77,6 +78,7 @@ def tensor_to_image(y: torch.Tensor) -> Image:
         im = Image.fromarray(arr.squeeze(2), 'L')
     return im
 
+@torch.no_grad()
 def cat_images(sequence_of_images: List[object]) -> Image:
     # https://stackoverflow.com/questions/30227466/combine-several-images-horizontally-with-python
     widths, heights = zip(*(i.size for i in sequence_of_images))
@@ -91,5 +93,7 @@ def cat_images(sequence_of_images: List[object]) -> Image:
         x_offset += im.size[0]
     return new_im
 
+
+@torch.no_grad()
 def chunk_and_cat(x: torch.Tensor) -> Image:
     return cat_images([tensor_to_image(x[:3]), tensor_to_image(x[3:])])

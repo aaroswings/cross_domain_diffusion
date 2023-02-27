@@ -5,26 +5,17 @@ import torch.nn.functional as F
 from data.dataset import chunk_and_cat
 
 import math
+import numpy as np
 import os
 
 from typing import Optional, Tuple
 
-def get_alphas_sigmas(t: torch.Tensor):
-    return torch.cos(t * math.pi / 2), torch.sin(t * math.pi / 2)
+def get_alphas_sigmas(logsnr_t: torch.Tensor):
+    return torch.sigmoid(logsnr_t).sqrt(), torch.sigmoid(-logsnr_t).sqrt()
 
-
-def alpha_sigma_to_t(alpha, sigma) -> torch.Tensor:
-    """Returns a timestep, given the scaling factors for the clean image and for
-    the noise."""
-    return torch.atan2(sigma, alpha) / math.pi * 2
-
-
-def get_t_schedule(t) -> torch.Tensor:
-    sigma = torch.sin(t * math.pi / 2) ** 2
-    alpha = (1 - sigma ** 2) ** 0.5
-    return alpha_sigma_to_t(alpha, sigma)
-
-
+"""
+Referenceing the paper "On the Importance of Noise Scheduling for Diffusion Models"
+"""
 @torch.no_grad()
 def get_noise(x, repeat_noise) -> torch.Tensor:
     assert x.size(1) % repeat_noise == 0
@@ -33,18 +24,37 @@ def get_noise(x, repeat_noise) -> torch.Tensor:
     return noise
 
 
+def cosine_schedule(t: torch.Tensor, start=0, end=1, tau=1, clip_min=1e-9):
+    v_start = math.cos(start * math.pi / 2) ** (2 * tau)
+    v_end = math.cos(end * math.pi / 2) ** (2 * tau)
+    output = torch.cos((t * (end - start) + start) * math.pi / 2) ** (2 * tau)
+    output = (v_end - output) / (v_end - v_start)
+    return torch.clip(output, clip_min, 1.)
+
+
+def get_alphas_sigmas(t):
+    """Returns the scaling factors for the clean image (alpha) and for the
+    noise (sigma), given a timestep."""
+    if t.dim() == 0:
+        t = t * torch.ones(1).to(t.device)
+    return torch.cos(t * math.pi / 2)[:, None, None, None], torch.sin(t * math.pi / 2)[:, None, None, None]
+
+
 def v_loss(
         net: nn.Module, 
         x: torch.Tensor, 
         c: torch.Tensor, 
         repeat_noise: int = 1, # shared latent
-        loss_scales: int = 1 # multiscale loss
+        loss_scales: int = 1, # multiscale loss
+        normalize=True
     ) -> torch.Tensor:
 
-    t = get_t_schedule(torch.rand(x.size(0), 1).to(x.device)) # batch of timesteps
+    t = cosine_schedule(torch.rand(x.size(0)).to(x.device)) # batch of timesteps
     alpha, sigma = get_alphas_sigmas(t)
+
     noise = get_noise(x, repeat_noise)
     inputs = alpha * x + noise * sigma
+    inputs = inputs / inputs.std(axis=(1, 2, 3), keepdims=True) if normalize else inputs
     targets = alpha * noise - x * sigma
 
     with torch.cuda.amp.autocast():
@@ -68,8 +78,10 @@ def v_paired_sample(
     unfreeze_b_at: float = 1.0,
     batch_size: int = 4,
     num_steps: int = 1000,
+    normalize=True,
     eta=0.0,
-    save_dir=None
+    save_dir=None,
+    device=None
 ):
     if a_guide is not None and b_guide is not None:
         assert a_guide.shape == b_guide.shape
@@ -77,28 +89,26 @@ def v_paired_sample(
     if a_guide is not None:
         batch_size = a_guide.size(0)
     else:
-        a_guide = torch.zeros(batch_size, 3, size, size).to(net.device)
+        a_guide = torch.zeros(batch_size, 3, size, size).to(device)
 
     if b_guide is not None:
         batch_size = a_guide.size(0)
     else:
-        b_guide = torch.zeros(batch_size, 3, size, size).to(net.device)
+        b_guide = torch.zeros(batch_size, 3, size, size).to(device)
 
     x = torch.cat([a_guide, b_guide], dim=1)
     noise = get_noise(x, 2)
 
-    ts = torch.linspace(t_start, 0, num_steps).to(net.device)
+    ts = cosine_schedule(torch.linspace(t_start, 0, num_steps).to(device))
     ts_next = ts[1:]
     ts = ts[:-1]
 
     for i, (t, t_next) in enumerate(zip(ts, ts_next)):
-        t = get_t_schedule(t * torch.ones(batch_size, 1))
-        t_next = get_t_schedule(t * torch.ones(batch_size, 1))
-
         alpha, sigma = get_alphas_sigmas(t)
         alpha_next, sigma_next = get_alphas_sigmas(t_next)
 
         inputs = alpha * x + noise * sigma
+        inputs = inputs / inputs.std(axis=(1, 2, 3), keepdims=True) if normalize else inputs
 
         with torch.cuda.amp.autocast():
             v = net(x, t, None)
@@ -111,7 +121,7 @@ def v_paired_sample(
             pred[:, 3:] = b_guide
             eps[:, 3:] = noise[:, 3:]
 
-        if i < size.size(0) - 1:
+        if i < ts.size(0) - 1:
             ddim_sigma = eta * (sigma_next**2 / sigma**2).sqrt() * \
                     (1 - alpha**2 / alpha_next**2).sqrt()
             adjusted_sigma = (sigma_next**2 - ddim_sigma**2).sqrt()
@@ -120,7 +130,8 @@ def v_paired_sample(
                 new_noise = get_noise(x, 2) * ddim_sigma
                 x += new_noise
                 
-                # double check this?
+                # double check this? 
+                # it's for the "ignore models predictions if unfreeze b" step just above
                 noise = noise * (alpha + adjusted_sigma) + new_noise
 
         # It's clunky to depend on chunk_and_cat in the dataset file, but otherwise memory would blow up
@@ -128,7 +139,7 @@ def v_paired_sample(
             os.makedirs(save_dir, exist_ok=True)
             for batch_i in range(x.size(0)):
                 img = chunk_and_cat(x[batch_i])
-                img.save(os.path.join(save_dir, f"sample_{batch_i}_at_timestep_{t}.jpeg"))
+                img.save(os.path.join(save_dir, f"sample_{batch_i}_at_timestep_index_{i}.jpeg"))
 
     return pred
 

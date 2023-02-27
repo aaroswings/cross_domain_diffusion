@@ -23,6 +23,15 @@ class CondBlock(nn.Module):
         raise NotImplementedError
 
 
+class XLayer(CondBlock):
+    def __init__(self, layer: nn.Module):
+        super().__init__()
+        self.layer = layer
+
+    def forward(self, x, t, c):
+        return self.layer(x)
+
+
 class SelfAttention2d(nn.Module):
     def __init__(self, num_channels, num_heads=1):
         super().__init__()
@@ -52,18 +61,13 @@ class ConditionedSequential(nn.Sequential, CondBlock):
         return x
 
 
-class CondIdentity(CondBlock):
-    def forward(self, x, temb, c):
-        return x
-
-
 class SkipBlock(CondBlock):
     def __init__(self, main: List[CondBlock], skip: Optional[CondBlock]=None):
         super().__init__()
         self.main = ConditionedSequential(*main)
 
     def forward(self, x, temb, c):
-        # in skip connects, scale the skip by root(2) as in SimpleDiffusion, Imagen net
+        # in skip connects, scale the skip by root(2) as in SimpleDiffusion, Imagen
         return x / torch.sqrt(torch.tensor(2)).to(x.device) + self.main(x, temb, c)
 
 
@@ -72,7 +76,7 @@ class GroupNorm(CondBlock):
             actvn_type: Optional[nn.Module] = nn.SiLU, eps: float = 1e-5):
         super().__init__()
         self.norm = nn.GroupNorm(num_groups, out_dim, eps, affine=True)
-        self.actvn = actvn_type(inplace=True) if actvn_type is not None else nn.Identity()
+        self.actvn = actvn_type() if actvn_type is not None else nn.Identity()
 
     def forward(self, x, emb, c):
         x = self.norm(x)
@@ -90,10 +94,10 @@ class ScaleShiftNorm(nn.Module):
         self.num_groups = num_groups
         self.eps = eps
         self.proj = nn.Sequential(
-            actvn_type(inplace=True) if actvn_type else nn.Identity(),
+            actvn_type() if actvn_type else nn.Identity(),
             zero_module(nn.Linear(emb_dim, out_dim * 2))
         )
-        self.actvn = actvn_type(inplace=True) if actvn_type else nn.Identity()
+        self.actvn = actvn_type() if actvn_type else nn.Identity()
     
     def forward(self, x, emb):
         assert x is not None
@@ -123,9 +127,9 @@ class ContextAdaGroupNorm(CondBlock):
         return self.norm (x, c)
     
 
-class ResConvBlock(CondBlock):
+class ResBlock(CondBlock):
     """
-    OpenAI-style residual convolution block. In the OpenAI model,
+    OpenAI-style/Imagen style residual convolution block. In the OpenAI model,
     the scale shift norm option allows adaptive group normalization using the timestep embedding
     in the "out_layers" subnet only, but in this version, the in_layers and out_layers
     subnets can either be a vanilla group norm or an adaptive group norm from either the c
@@ -142,6 +146,8 @@ class ResConvBlock(CondBlock):
             conv2d_type: nn.Module = nn.Conv2d, 
             actvn_type: nn.Module = nn.SiLU):
         super().__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
         # 0. Normalization layer types.
         norm_in = norm_in_type(32, in_channels, emb_dim, actvn_type)
         norm_out = norm_out_type(32, out_channels, emb_dim, actvn_type)
@@ -165,76 +171,21 @@ class ResConvBlock(CondBlock):
         return self.main(x, temb, c) + self.skip(x)
 
 
-class ConvBlock(CondBlock):
-    """
-    OpenAI-style residual convolution block. In the OpenAI model,
-    the scale shift norm option allows adaptive group normalization using the timestep embedding
-    in the "out_layers" subnet only, but in this version, the in_layers and out_layers
-    subnets can either be a vanilla group norm or an adaptive group norm from either the c
-    vector or the timestep embedding.
-    """
-    def __init__(
-            self, 
-            in_channels: int, 
-            out_channels: int, 
-            temb_dim: int,
-            c_dim: int,
-            p_dropout: float = 0.0,
-            norm_in_type: CondBlock = GroupNorm, 
-            norm_out_type: CondBlock = GroupNorm,
-            conv2d_type: nn.Module = nn.Conv2d, 
-            actvn_type: nn.Module = nn.SiLU):
-        super().__init__()
-        # 0. Normalization layer types.
-        if norm_in_type == GroupNorm or norm_in_type == TimestepAdaGroupNorm:
-            norm_in = norm_in_type(32, in_channels, temb_dim, actvn_type)
-        elif norm_in_type == ContextAdaGroupNorm:
-            norm_in = norm_in_type(32, in_channels, c_dim, actvn_type)
-        else:
-            raise NotImplementedError("Only GroupNorm, TimestepAdaGroupNorm, or ContextAdaGroupNorm types are supported")
-
-        if norm_out_type == GroupNorm or norm_out_type == TimestepAdaGroupNorm:
-            norm_out = norm_in_type(32, out_channels, temb_dim, actvn_type)
-        elif norm_out_type == ContextAdaGroupNorm:
-            norm_out = norm_in_type(32, out_channels, c_dim, actvn_type)
-        else:
-            raise NotImplementedError("Only GroupNorm, TimestepAdaGroupNorm, or ContextAdaGroupNorm types are supported")
-
-        # 1. Hidden blocks.
-        self.main = ConditionedSequential(
-            norm_in,
-            conv2d_type(in_channels, out_channels, 3, padding=1),
-            norm_out,
-            nn.Dropout(p_dropout),
-            zero_module(conv2d_type(out_channels, out_channels, 3, padding=1))
-        )
-
-        # 2. Skip connection.
-        if in_channels == out_channels:
-            self.skip = nn.Identity()
-        else:
-            self.skip = conv2d_type(in_channels, out_channels, 1, bias=False)
-
-    def forward(self, x, temb, c):
-        assert x is not None
-        x = self.main(x, temb, c) + self.skip(x)
-        assert x is not None
-        return x
-
-
 """
 References: 
 https://github.com/huggingface/diffusers/blob/589faa8c881de32932faebf92d2d8007135294d6/src/diffusers/models/unet_2d.py#L126
 https://github.com/crowsonkb/v-diffusion-pytorch/blob/master/diffusion/models/danbooru_128.py#L59
 """
 class FourierFeatures(nn.Module):
-    def __init__(self, in_features, out_features, std=1.):
+    def __init__(self, out_features, std=16.):
         super().__init__()
         assert out_features % 2 == 0
-        self.weight = nn.Parameter(torch.randn([out_features // 2, in_features]) * std)
+        self.weight = nn.Parameter(torch.randn(out_features // 2) * std, requires_grad=False)
 
     def forward(self, input):
-        f = 2 * math.pi * input @ self.weight.T
+        if input.dim() == 0:
+            input = torch.ones(1).to(input.device) * input
+        f = 2 * math.pi * torch.log(input)[:, None] @ self.weight[None, :]
         return torch.cat([f.cos(), f.sin()], dim=-1)
 
 
