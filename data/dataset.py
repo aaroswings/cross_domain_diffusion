@@ -7,7 +7,7 @@ from sortedcollections import OrderedSet
 import numpy as np
 import os
 from PIL import Image
-from typing import List
+from typing import List, Tuple
 
 IMG_EXTENSIONS = [
     '.jpg', '.JPG', '.jpeg', '.JPEG',
@@ -31,17 +31,15 @@ def get_image_file_names(dir) -> set[str]:
 
 
 class PairedDataset(Dataset):
-    def __init__(self, root_a: str, root_b: str, size: int = 256):
+    def __init__(self, roots: Tuple[str, str], size: int = 256, channels=(3, 3)):
         super().__init__()
-        self.root_a = root_a
-        self.root_b = root_b
-        self.files = get_image_file_names(root_a) | get_image_file_names(root_b)
+        self.root_a, self.root_b = roots
+        self.channels_a, self.channels_b = channels
+        self.files = get_image_file_names(self.root_a) | get_image_file_names(self.root_b)
         self.size = size
-
 
     def __len__(self): 
         return len(self.files)
-    
 
     def load_image(self, path):
         img = Image.open(path).convert('RGB')
@@ -61,7 +59,7 @@ class PairedDataset(Dataset):
         a, b = TF.to_tensor(img_a), TF.to_tensor(img_b)
 
         # center on 0
-        x = torch.cat([a, b], dim=0) * 2.0 - 1.0
+        x = torch.cat([a[:self.channels_a], b[:self.channels_b]], dim=0) * 2.0 - 1.0
 
         return x
 
@@ -95,5 +93,13 @@ def cat_images(sequence_of_images: List[object]) -> Image:
 
 
 @torch.no_grad()
-def chunk_and_cat(x: torch.Tensor) -> Image:
-    return cat_images([tensor_to_image(x[:3]), tensor_to_image(x[3:])])
+def minmax_scale(x: torch.Tensor, quantile=1.0) -> torch.Tensor:
+    a = -1
+    b = 1
+    return (b - a) * (x - x.min()) / (x.max() - x.min()) + a
+
+
+@torch.no_grad()
+def chunk_and_cat(x: torch.Tensor, channels=3) -> Image:
+    return cat_images([tensor_to_image(x[:channels]), tensor_to_image(x[channels:])])
+
