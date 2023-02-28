@@ -1,4 +1,4 @@
-from diffusion.trainer import TrainPairedConcat
+from train.trainer import TrainPairedConcat
 
 trainer = TrainPairedConcat(
     ("./data/anime_sketch_color/train/color", "./data/anime_sketch_color/train/sketch"),
@@ -14,5 +14,5 @@ trainer = TrainPairedConcat(
     repeat_noise = 2,
     sample_eta=0.1,
     loss_scales=1,
-    validate_every=200
+    validate_every=5000
 ).train()

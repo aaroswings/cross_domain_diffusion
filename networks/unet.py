@@ -158,7 +158,7 @@ class UNet(nn.Module):
         self.project_output = nn.Sequential(
             nn.GroupNorm(32, channels[0]),
             Activations[actvn_name](),
-            zero_module(Conv2DLayers[conv2d_out_name](channels[0], out_channels, 3, padding=1, bias=False))
+            Conv2DLayers[conv2d_out_name](channels[0], out_channels, 3, padding=1, bias=False)
         )
 
         self.register_buffer('root2', torch.sqrt(torch.tensor(2)))
