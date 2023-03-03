@@ -2,13 +2,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from abc import abstractmethod
 import math
 from typing import List, Optional
-
-# via github.com/crowsonkb/v-diffusion-pytorch/
-# via github.com/openai/guided-diffusion
-# via github.com/VSehwag/minimal-diffusion/
+from abc import abstractmethod
 
 
 def zero_module(module):
@@ -17,72 +13,31 @@ def zero_module(module):
     return module
 
 
-class CondBlock(nn.Module):
-    @abstractmethod
-    def forward(self, x, temb, c):
-        raise NotImplementedError
-
-
-class XLayer(CondBlock):
-    def __init__(self, layer: nn.Module):
+class FourierFeatures(nn.Module):
+    def __init__(self, out_features, std=16.):
         super().__init__()
-        self.layer = layer
-
-    def forward(self, x, t, c):
-        return self.layer(x)
-
-
-class SelfAttention2d(nn.Module):
-    def __init__(self, num_channels, num_heads=1):
-        super().__init__()
-        assert num_channels % num_heads == 0
-        self.n_head = num_heads
-        self.qkv_proj = nn.Conv2d(num_channels, num_channels * 3, 1)
-        self.out_proj = nn.Conv2d(num_channels, num_channels, 1)
+        assert out_features % 2 == 0
+        self.weight = nn.Parameter(torch.randn(out_features // 2) * std, requires_grad=False)
 
     def forward(self, input):
-        n, c, h, w = input.shape
-        qkv = self.qkv_proj(input)
-        qkv = qkv.view([n, self.n_head * 3, c // self.n_head, h * w]).transpose(2, 3)
-        q, k, v = qkv.chunk(3, dim=1)
-        scale = k.shape[3]**-0.25
-        att = ((q * scale) @ (k.transpose(2, 3) * scale)).softmax(3)
-        y = (att @ v).transpose(2, 3).contiguous().view([n, c, h, w])
-        return input + self.out_proj(y)
+        if input.dim() == 0:
+            input = torch.ones(1).to(input.device) * input
+        f = 2 * math.pi * torch.log(input)[:, None] @ self.weight[None, :]
+        return torch.cat([f.cos(), f.sin()], dim=-1)
+    
 
-
-class ConditionedSequential(nn.Sequential, CondBlock):
-    def forward(self, x, temb, c):
-        assert x is not None
-        for layer in self:
-            assert x is not None
-            x = layer(x, temb, c) if isinstance(layer, CondBlock) else layer(x)
-            assert x is not None
-        return x
-
-
-class SkipBlock(CondBlock):
-    def __init__(self, main: List[CondBlock], skip: Optional[CondBlock]=None):
-        super().__init__()
-        self.main = ConditionedSequential(*main)
-
-    def forward(self, x, temb, c):
-        # in skip connects, scale the skip by root(2) as in SimpleDiffusion, Imagen
-        return x / torch.sqrt(torch.tensor(2)).to(x.device) + self.main(x, temb, c)
-
-
-class GroupNorm(CondBlock):
-    def __init__(self, num_groups: int, out_dim: int, emb_dim: int,
+class GroupNorm(nn.Module):
+    def __init__(self, num_groups: int, channels: int,
             actvn_type: Optional[nn.Module] = nn.SiLU, eps: float = 1e-5):
         super().__init__()
-        self.norm = nn.GroupNorm(num_groups, out_dim, eps, affine=True)
+        self.norm = nn.GroupNorm(num_groups, channels, eps, affine=True)
         self.actvn = actvn_type() if actvn_type is not None else nn.Identity()
 
-    def forward(self, x, emb, c):
+    def forward(self, x):
         x = self.norm(x)
         x = self.actvn(x)
         return x
-
+    
 
 class ScaleShiftNorm(nn.Module):
     def __init__(
@@ -107,97 +62,59 @@ class ScaleShiftNorm(nn.Module):
         x = x * (1 + scale) + shift
         x = self.actvn(x)
         return x
+    
 
-
-class TimestepAdaGroupNorm(CondBlock):
-    def __init__(self, *args):
+class SelfAttention2d(nn.Module):
+    def __init__(self, num_channels, num_heads=1):
         super().__init__()
-        self.norm = ScaleShiftNorm(*args)
-    
-    def forward(self, x, temb, c):
-        return self.norm(x, temb)
-    
+        assert num_channels % num_heads == 0
+        self.n_head = num_heads
+        self.qkv_proj = nn.Conv2d(num_channels, num_channels * 3, 1)
+        self.out_proj = nn.Conv2d(num_channels, num_channels, 1)
 
-class ContextAdaGroupNorm(CondBlock):
-    def __init__(self, *args):
-        super().__init__()
-        self.norm = ScaleShiftNorm(*args)
-    
-    def forward(self, x, temb, c):
-        return self.norm (x, c)
-    
+    def forward(self, input):
+        n, c, h, w = input.shape
+        qkv = self.qkv_proj(input)
+        qkv = qkv.view([n, self.n_head * 3, c // self.n_head, h * w]).transpose(2, 3)
+        q, k, v = qkv.chunk(3, dim=1)
+        scale = k.shape[3]**-0.25
+        att = ((q * scale) @ (k.transpose(2, 3) * scale)).softmax(3)
+        y = (att @ v).transpose(2, 3).contiguous().view([n, c, h, w])
+        return input + self.out_proj(y)
 
-class ResBlock(CondBlock):
-    """
-    OpenAI-style/Imagen style residual convolution block. In the OpenAI model,
-    the scale shift norm option allows adaptive group normalization using the timestep embedding
-    in the "out_layers" subnet only, but in this version, the in_layers and out_layers
-    subnets can either be a vanilla group norm or an adaptive group norm from either the c
-    vector or the timestep embedding.
-    """
+
+class ResBlock(nn.Module):
     def __init__(
             self, 
             in_channels: int, 
             out_channels: int, 
             emb_dim: int,
             p_dropout: float = 0.0,
-            norm_in_type: CondBlock = GroupNorm, 
-            norm_out_type: CondBlock = GroupNorm,
             conv2d_type: nn.Module = nn.Conv2d, 
             actvn_type: nn.Module = nn.SiLU):
         super().__init__()
-        self.in_channels = in_channels
-        self.out_channels = out_channels
-        # 0. Normalization layer types.
-        norm_in = norm_in_type(32, in_channels, emb_dim, actvn_type)
-        norm_out = norm_out_type(32, out_channels, emb_dim, actvn_type)
+        self.group_norm = GroupNorm(32, in_channels, actvn_type)
+        self.conv_hidden1 = conv2d_type(in_channels, out_channels, 3, padding=1)
+        self.scaleshift_norm = ScaleShiftNorm(32, out_channels, emb_dim, actvn_type)
+        self.dropout = nn.Dropout(p_dropout) if p_dropout else nn.Identity()
+        self.conv_hidden2 = zero_module(conv2d_type(out_channels, out_channels, 3, padding=1))
+        self.skip = nn.Identity() if in_channels == out_channels else conv2d_type(in_channels, out_channels, 1, bias=False)
+        
+    def forward(self, x, emb):
+        h = x
+        h = self.group_norm(h)
+        h = self.conv_hidden1(h)
+        h = self.scaleshift_norm(h, emb)
+        h = self.dropout(h)
+        h = self.conv_hidden2(h)
 
-        # 1. Hidden blocks.
-        self.main = ConditionedSequential(
-            norm_in,
-            conv2d_type(in_channels, out_channels, 3, padding=1),
-            norm_out,
-            nn.Dropout(p_dropout),
-            zero_module(conv2d_type(out_channels, out_channels, 3, padding=1))
-        )
-
-        # 2. Skip connection.
-        if in_channels == out_channels:
-            self.skip = nn.Identity()
-        else:
-            self.skip = conv2d_type(in_channels, out_channels, 1, bias=False)
-
-    def forward(self, x, temb, c):
-        return self.main(x, temb, c) + self.skip(x)
-
-
-"""
-References: 
-https://github.com/huggingface/diffusers/blob/589faa8c881de32932faebf92d2d8007135294d6/src/diffusers/models/unet_2d.py#L126
-https://github.com/crowsonkb/v-diffusion-pytorch/blob/master/diffusion/models/danbooru_128.py#L59
-"""
-class FourierFeatures(nn.Module):
-    def __init__(self, out_features, std=16.):
-        super().__init__()
-        assert out_features % 2 == 0
-        self.weight = nn.Parameter(torch.randn(out_features // 2) * std, requires_grad=False)
-
-    def forward(self, input):
-        if input.dim() == 0:
-            input = torch.ones(1).to(input.device) * input
-        f = 2 * math.pi * torch.log(input)[:, None] @ self.weight[None, :]
-        return torch.cat([f.cos(), f.sin()], dim=-1)
-
-
-def expand_to_planes(input, shape):
-    return input[..., None, None].repeat([1, 1, shape[2], shape[3]])
+        return h + self.skip(x)
 
 
 # export types without creating an import dependency on on this file when creating objects using these modules
 NormalizationLayers = {
     'groupnorm': GroupNorm,
-    'ada_groupnorm_temb': TimestepAdaGroupNorm,
-    'ada_groupnorm_cond': ContextAdaGroupNorm
+    'scale_shift_norm': ScaleShiftNorm,
 }
 
 Activations = {
