@@ -1,5 +1,6 @@
+.vscode
 **/__pycache__
 *.ipynb
 tester.py
 data/anime_sketch_color
-runs/
+train_run/

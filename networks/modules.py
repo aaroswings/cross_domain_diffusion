@@ -4,7 +4,6 @@ import torch.nn.functional as F
 
 import math
 from typing import List, Optional
-from abc import abstractmethod
 
 
 def zero_module(module):
@@ -50,7 +49,7 @@ class ScaleShiftNorm(nn.Module):
         self.eps = eps
         self.proj = nn.Sequential(
             actvn_type() if actvn_type else nn.Identity(),
-            zero_module(nn.Linear(emb_dim, out_dim * 2))
+            nn.Linear(emb_dim, out_dim * 2)
         )
         self.actvn = actvn_type() if actvn_type else nn.Identity()
     
@@ -97,7 +96,7 @@ class ResBlock(nn.Module):
         self.conv_hidden1 = conv2d_type(in_channels, out_channels, 3, padding=1)
         self.scaleshift_norm = ScaleShiftNorm(32, out_channels, emb_dim, actvn_type)
         self.dropout = nn.Dropout(p_dropout) if p_dropout else nn.Identity()
-        self.conv_hidden2 = zero_module(conv2d_type(out_channels, out_channels, 3, padding=1))
+        self.conv_hidden2 = conv2d_type(out_channels, out_channels, 3, padding=1)
         self.skip = nn.Identity() if in_channels == out_channels else conv2d_type(in_channels, out_channels, 1, bias=False)
         
     def forward(self, x, emb):
@@ -109,7 +108,46 @@ class ResBlock(nn.Module):
         h = self.conv_hidden2(h)
 
         return h + self.skip(x)
+    
+class MLPConv(nn.Module):
+    def __init__(
+            self,
+            in_channels: int, 
+            out_channels: int, 
+            emb_dim: int,
+            p_dropout: float = 0.0,
+            conv2d_type: nn.Module = nn.Conv2d, 
+            actvn_type: nn.Module = nn.SiLU
+        ):
+        super().__init__()
+        self.scaleshift_norm = ScaleShiftNorm(32, out_channels, emb_dim, actvn_type)
+        self.dropout = nn.Dropout(p_dropout) if p_dropout else nn.Identity()
+        self.conv_out = conv2d_type(in_channels, out_channels, 1, bias=False)
 
+    def forward(self, x, emb):
+        x = self.scaleshift_norm(x, emb)
+        x = self.dropout(x)
+        x = self.conv_out(x)
+        return x
+
+class DWConv2d(nn.Module):
+    def __init__(
+            self,
+            in_channels, 
+            out_channels, 
+            kernel_size: int = 3, 
+            stride: int = 1, 
+            padding: int = 0,
+            bias=True):
+        super().__init__()
+        self.spacewise = nn.Conv2d(in_channels, max(in_channels, out_channels), kernel_size, stride, padding, bias=False, groups=min(in_channels, out_channels))
+        self.pointwise = nn.Conv2d(max(in_channels, out_channels), out_channels, 1, stride, 0, bias=bias)
+
+    def forward(self, x):
+        x = self.spacewise(x)
+        x = F.silu(x)
+        x = self.pointwise(x)
+        return x
 
 # export types without creating an import dependency on on this file when creating objects using these modules
 NormalizationLayers = {
@@ -123,5 +161,6 @@ Activations = {
 }
 
 Conv2DLayers = {
-    'conv2d': nn.Conv2d
+    'conv2d': nn.Conv2d,
+    'depthwise_conv2d': DWConv2d
 }
