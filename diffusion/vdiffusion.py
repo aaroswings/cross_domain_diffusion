@@ -36,15 +36,6 @@ class VDiffusion(nn.Module):
         self.init_config_ = config
         for k, v in asdict(config).items():
             self.__setattr__(k, v)
-        
-    def state_dict(self) -> dict:
-        return dict(
-            [(k, self.__getattr__(k))
-            for k in self.init_config_.keys()]
-        )
-    
-    def load_state_dict(self, state_dict: Mapping[str, Any], strict: bool = True):
-        self.set_state_from_config(VDiffusionConfig(**state_dict))
 
     def loss(self, net, batch: torch.Tensor) -> torch.Tensor:
         x0 = batch.to(next(net.parameters()).device)
