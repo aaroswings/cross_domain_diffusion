@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from einops import repeat, rearrange
 
 import math
 from typing import List, Optional
@@ -90,7 +91,8 @@ class ResBlock(nn.Module):
             emb_dim: int,
             p_dropout: float = 0.0,
             conv2d_type: nn.Module = nn.Conv2d, 
-            actvn_type: nn.Module = nn.SiLU):
+            actvn_type: nn.Module = nn.SiLU
+    ):
         super().__init__()
         self.group_norm = GroupNorm(32, in_channels, actvn_type)
         self.conv_hidden1 = conv2d_type(in_channels, out_channels, 3, padding=1)
@@ -118,7 +120,7 @@ class MLPConv(nn.Module):
             p_dropout: float = 0.0,
             conv2d_type: nn.Module = nn.Conv2d, 
             actvn_type: nn.Module = nn.SiLU
-        ):
+    ):
         super().__init__()
         self.scaleshift_norm = ScaleShiftNorm(32, out_channels, emb_dim, actvn_type)
         self.dropout = nn.Dropout(p_dropout) if p_dropout else nn.Identity()
@@ -138,7 +140,8 @@ class DWConv2d(nn.Module):
             kernel_size: int = 3, 
             stride: int = 1, 
             padding: int = 0,
-            bias=True):
+            bias=True
+    ):
         super().__init__()
         self.spacewise = nn.Conv2d(in_channels, max(in_channels, out_channels), kernel_size, stride, padding, bias=False, groups=min(in_channels, out_channels))
         self.pointwise = nn.Conv2d(max(in_channels, out_channels), out_channels, 1, stride, 0, bias=bias)
@@ -148,6 +151,53 @@ class DWConv2d(nn.Module):
         x = F.silu(x)
         x = self.pointwise(x)
         return x
+    
+
+# based on Phil Wang's implementation of simple diffusion from github.com/lucidrains/denoising-diffusion-pytorch
+class UpsampleShuffle(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        dim_out: Optional[int] = None,
+        factor: int = 2
+    ):
+        super().__init__()
+        self.factor = factor
+        self.factor_squared = factor ** 2
+
+        dim_out = dim_out or dim
+        conv = nn.Conv2d(dim, dim_out * self.factor_squared, 1)
+
+        self.net = nn.Sequential(
+            conv,
+            nn.SiLU(),
+            nn.PixelShuffle(factor)
+        )
+
+        self.init_conv_(conv)
+
+    def init_conv_(self, conv):
+        o, i, h, w = conv.weight.shape
+        conv_weight = torch.empty(o // self.factor_squared, i, h, w)
+        nn.init.kaiming_uniform_(conv_weight)
+        conv_weight = repeat(conv_weight, 'o ... -> (o r) ...', r = self.factor_squared)
+
+        conv.weight.data.copy_(conv_weight)
+        nn.init.zeros_(conv.bias.data)
+
+    def forward(self, x):
+        return self.net(x)
+    
+def DownsampleRearrange(
+    dim: int,
+    dim_out: Optional[int] = None,
+    factor: int = 2
+):
+    return nn.Sequential(
+        rearrange('b c (h p1) (w p2) -> b (c p1 p2) h w', p1 = factor, p2 = factor),
+        nn.Conv2d(dim * (factor ** 2), dim_out or dim, 1)
+    )
+
 
 # export types without creating an import dependency on on this file when creating objects using these modules
 NormalizationLayers = {

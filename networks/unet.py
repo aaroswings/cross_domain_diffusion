@@ -5,7 +5,16 @@ import torch.nn.functional as F
 from dataclasses import dataclass, asdict
 from typing import Tuple, Optional
 
-from networks.modules import FourierFeatures, ResBlock, SelfAttention2d, MLPConv, Conv2DLayers, Activations
+from networks.modules import (
+    FourierFeatures, 
+    ResBlock, 
+    SelfAttention2d, 
+    MLPConv,
+    UpsampleShuffle,
+    DownsampleRearrange,
+    Conv2DLayers, 
+    Activations
+)
 
 @dataclass()
 class UNetConfig:
@@ -21,6 +30,7 @@ class UNetConfig:
     conv2d_in_name: str = 'conv2d'
     conv2d_name: str = 'conv2d'
     conv2d_out_name: str = 'conv2d'
+    downsample_name: str = 'avg_pool' # or pixel_shuffle
 
     def build(self):
         if self.name == 'unet':
@@ -53,14 +63,17 @@ class UNet(nn.Module):
         for i in range(self.num_feature_map_sizes - 1):
             resblocks = [
                 ResBlock(self.channels[i], 
-                        self.channels[i] if block_ri > 0 else self.channels[i + 1], 
+                        self.channels[i], 
                         self.emb_dim,
                         self.p_dropouts[i], 
                         Conv2DLayers[self.conv2d_name], 
                         Activations[self.actvn_name])
-                for block_ri in reversed(range(self.block_depth[i]))]
-            down_blocks.append(nn.ModuleList(resblocks))
+                for _ in range(self.block_depth[i])]
+            downsample = [DownsampleRearrange(self.channels[i], self.channels[i + 1])]
+            down_blocks.append(nn.ModuleList(resblocks + downsample))
+            
         self.down_blocks = nn.ModuleList(down_blocks)
+
 
         self.middle_mlp_blocks = nn.ModuleList([
             MLPConv(self.channels[-1], 
@@ -75,14 +88,15 @@ class UNet(nn.Module):
 
         up_blocks = []
         for i in range(self.num_feature_map_sizes - 1):
+            upsample = [UpsampleShuffle(self.channels[-i - 1], self.channels[-i - 2])]
             resblocks = [
-                ResBlock(self.channels[-i - 2] if block_i > 0 else self.channels[-i - 1], 
+                ResBlock(self.channels[-i - 2], 
                          self.channels[-i - 2],
                          self.emb_dim,
                          self.p_dropouts[-i - 2], 
                          Conv2DLayers[self.conv2d_name], Activations[self.actvn_name])
                 for block_i in range(self.block_depth[-i - 2])]
-            up_blocks.append(nn.ModuleList(resblocks))
+            up_blocks.append(nn.ModuleList(upsample + resblocks))
         self.up_blocks = nn.ModuleList(up_blocks)
 
         self.print_param_count()
@@ -108,19 +122,21 @@ class UNet(nn.Module):
         hs = []
         last_h = h0
 
-        for resblocks in self.down_blocks:
-            for resblock in resblocks:
+        for down_block in self.down_blocks:
+            for resblock in down_block[:-1]:
                 last_h = resblock(last_h, emb)
                 hs.append(last_h)
-            last_h = F.avg_pool2d(last_h, 2)
+            downsample = down_block[-1]
+            last_h = downsample(last_h)
 
         for mlp_block, attn_layer in zip(self.middle_mlp_blocks, self.middle_attn_layers):
             last_h = mlp_block(last_h, emb)
             last_h = attn_layer(last_h)
 
-        for resblocks in self.up_blocks:
-            last_h = F.interpolate(last_h, scale_factor=2)
-            for resblock in resblocks:
+        for up_block in self.up_blocks:
+            upsample = up_block[0]
+            last_h = upsample(last_h)
+            for resblock in up_block[1:]:
                 skip_h = hs.pop()
                 last_h = (last_h + skip_h) / self.root2
                 last_h = resblock(last_h, emb)
