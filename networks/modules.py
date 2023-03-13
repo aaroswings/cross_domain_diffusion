@@ -96,7 +96,7 @@ class ResBlock(nn.Module):
         self.conv_hidden1 = conv2d_type(in_channels, out_channels, 3, padding=1)
         self.scaleshift_norm = ScaleShiftNorm(32, out_channels, emb_dim, actvn_type)
         self.dropout = nn.Dropout(p_dropout) if p_dropout else nn.Identity()
-        self.conv_hidden2 = conv2d_type(out_channels, out_channels, 3, padding=1)
+        self.conv_hidden2 = zero_module(conv2d_type(out_channels, out_channels, 3, padding=1))
         self.skip = nn.Identity() if in_channels == out_channels else conv2d_type(in_channels, out_channels, 1, bias=False)
         
     def forward(self, x, emb):

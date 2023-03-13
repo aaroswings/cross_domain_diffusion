@@ -5,41 +5,39 @@ import numpy as np
 from PIL import Image
 from typing import List, Tuple
 
-def t_to_phi(t):
-    return t * math.pi / 2
 
-def phi_to_alpha_sigma(phi):
-    if not isinstance(phi, torch.Tensor):
-        phi = torch.Tensor(phi)
-
-    clip_min = 1e-9
-
-    if phi.dim() == 0:
-        phi = phi.view(1, 1, 1, 1)
-    elif phi.dim() == 1:
-        phi = phi[:, None, None, None]
+def t_to_alpha_sigma(t):
+    if not isinstance(t, torch.Tensor):
+        t = torch.Tensor(t)
+    if t.dim() == 0:
+        t = t.view(1, 1, 1, 1)
+    elif t.dim() == 1:
+        t = t[:, None, None, None]
     else:
         raise ValueError('phi should be either a 0-dimensional float or 1-dimensional float array')
     
-    alpha = torch.clip(torch.cos(phi), clip_min, 1.)
-    sigma = torch.clip(torch.sin(phi), clip_min, 1.)
+    clip_min = 1e-9
+    
+    alpha = torch.clip(torch.cos(t * math.pi / 2), clip_min, 1.)
+    sigma = torch.clip(torch.sin(t * math.pi / 2), clip_min, 1.)
 
     return alpha, sigma
 
-def t_to_alpha_sigma(t):
-    phi = t_to_phi(t)
-    return phi_to_alpha_sigma(phi)
-
 def dynamic_thresholding(x, t, q=0.999):
     """
-    At t=0, clip x to [-1, 1].
+    At t=0, clip to [-1, 1].
     """
     s = torch.quantile(x.view(x.size(0), -1).abs(), q, dim=1).max()
-    low_bound = -s * t + -1. * (1. - t)
-    high_bound = s * t + 1. * (1. - t)
+    alpha_s = s * t + (1. - t)
+
+    low_bound = torch.min(-alpha_s, -1.0)
+    high_bound = torch.max(alpha_s, 1.0)
     return torch.clip(x, low_bound, high_bound)
 
 def sigma_dynamic_thresholding(x, sigma):
+    """
+    Intended as an option for z_t
+    """
     minmax = 2. * sigma + 1.
     return torch.clip(x, -minmax, minmax)
 

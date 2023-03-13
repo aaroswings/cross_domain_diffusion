@@ -96,6 +96,11 @@ class UNet(nn.Module):
         return next(self.parameters()).device
 
     def forward(self, x, t, c: Optional[torch.tensor] = None) -> torch.Tensor:
+        device = next(self.parameters()).device
+        x = x.to(device)
+        t = t.to(device)
+        if c is not None:
+            c = c.to(device)
         emb = self.t_embed(t)
         emb = self.t_project(emb)
 

@@ -5,7 +5,7 @@ from torch.cuda.amp import GradScaler
 from torch.nn.utils import clip_grad_value_
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
-
+import gc
 import os
 from pathlib import Path
 from dataclasses import dataclass, asdict
@@ -61,7 +61,7 @@ class Trainer(nn.Module):
             self.net = self._net_config.build().cuda()
 
         if not hasattr(self, 'vdiffusion') or self.vdiffusion is None:
-            self.vdiffusion = self._vdiffusion_config.build()
+            self.vdiffusion = self._vdiffusion_config.build().cuda()
 
         if not hasattr(self, 'optimizer') or self.optimizer is None:
             self.optimizer = optim.Adam([*self.net.parameters()], lr=0.0, betas=self.adam_betas, eps=1e-6)
@@ -90,6 +90,7 @@ class Trainer(nn.Module):
         self.optimizer = None
         self.lr_scheduler = None
         self.ema = None
+        gc.collect()
 
     def restore_or_create_root(self) -> Path:
         """
@@ -170,8 +171,9 @@ class Trainer(nn.Module):
                     return func(self, *args, **kwargs)
                 except KeyboardInterrupt:
                     print('Function interrupted, clearning memory.')
-                    self.destruct_state_objs()
                     self.save()
+                    self.destruct_state_objs()
+                    
                     entry = input('Reload and continue? y=continue, n=quit:\t')
                     if entry == 'y':
                         step = self.load_latest()
@@ -198,8 +200,15 @@ class Trainer(nn.Module):
     def sample(self, batch, guided = False, subfolder = None):
         save_dir = self.out_dir / (f'samples_step_{self.global_step}_' + ('guided' if guided else 'unguided'))
         save_dir = save_dir / subfolder if subfolder else save_dir
-        samples = self.vdiffusion.sample(self.ema.ema_model, batch, guided)
-        save_samples(samples, save_dir, self.vdiffusion.channel_split)
+        xs_save_dir = save_dir / 'xs'
+        zs_save_dir = save_dir / 'zs'
+        xs, zs = self.vdiffusion.sample(
+            net=self.ema.ema_model, 
+            x0=batch,
+            guide_with_frozen_channels=guided,
+            use_tqdm=True)
+        save_samples(xs, xs_save_dir, self.vdiffusion.sample_channel_split)
+        save_samples(zs, zs_save_dir, self.vdiffusion.sample_channel_split)
         
 
     @__interruptible
@@ -213,7 +222,7 @@ class Trainer(nn.Module):
     def forward_backward(self, batch):
         self.lr_scheduler.update(self.global_step)
         self.optimizer.zero_grad()
-        loss = self.vdiffusion.loss(self.net, batch)
+        loss = self.vdiffusion.loss(self.net, batch, self.global_step, self.total_steps)
         self.scaler.scale(loss).backward()
         self.scaler.unscale_(self.optimizer)
         clip_grad_value_(self.net.parameters(), 1.0)
