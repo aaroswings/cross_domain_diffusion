@@ -111,7 +111,6 @@ class VDiffusion(nn.Module):
             target = alpha * eps - sigma * x0 # v
             y = v_pred
         elif self.loss_type == 'x0':
-            # Predict the (maybe normalized) x0 reconstruction
             target = x0
             y = alpha * z_t - sigma * v_pred
         elif self.loss_type == 'eps':
