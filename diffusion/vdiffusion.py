@@ -77,7 +77,7 @@ class VDiffusion(nn.Module):
         self.register_buffer('ts', torch.linspace(0, 1, self.t_steps + 1))
         
     @torch.no_grad()
-    def scheduled_sampling_zt(self, net, x0, eps, t, t_idx, train_step, total_steps):
+    def scheduled_sampling_zt(self, net, x0, eps, context, t, t_idx, train_step, total_steps):
         device = net.get_device()
         batch_size = x0.size(0)
         # increasing over training
@@ -86,7 +86,6 @@ class VDiffusion(nn.Module):
         
         mt_max = 1 - t.max()
         m_t = torch.clip((torch.randn(1).to(device) * mt_max * m_current_weight).abs(), 0, mt_max)
-        # convert continuous m_t in [0, 1] to discrete timestep
         m_steps = (m_t * (self.ts.size(0) - 1)).to(torch.long).item() # number of steps to take
 
         if self.sample_frozen_channels is not None:
@@ -96,7 +95,7 @@ class VDiffusion(nn.Module):
             samples_guided_by_frozen_channels = None
 
         assert((t_idx + m_steps).max() < self.ts.size(0))
-        xs, zs = self.sample(net, x0, eps, intermediates_every=m_steps + 1,
+        xs, zs = self.sample(net, x0, eps, context, intermediates_every=m_steps + 1,
             start_step=t_idx + m_steps, end_step = t_idx, sample_eta=0.0,
             batch_subset_guided_by_frozen_channels=samples_guided_by_frozen_channels)
         z_t = zs[-1]
@@ -125,6 +124,7 @@ class VDiffusion(nn.Module):
             eps_pred = sigma * z_t + alpha * v_pred
             y = alpha_next * eps_pred - sigma_next * x0_pred
         elif self.loss_type == 'peek':
+            
             # v loss for timesteps t, t - 1, and t + 1
             t_next = self.ts[t_idx - 1]
             alpha_next, sigma_next = t_to_alpha_sigma(t_next)
@@ -152,12 +152,19 @@ class VDiffusion(nn.Module):
     def loss(
         self, 
         net, 
-        batch: torch.Tensor, 
+        batch: Union[torch.Tensor, Tuple[torch.Tensor]], 
         train_step: int, 
         total_steps: int
-        ) -> torch.Tensor:
+    ) -> torch.Tensor:
         device = net.get_device()
-        x0 = batch.to(device)
+
+        if isinstance(batch, torch.Tensor):
+            x0 = batch.to(device)
+            context = None
+        elif isinstance(batch, tuple):
+            x0, context = batch
+            x0, context = x0.to(device), context.to(device)
+
         eps = torch.randn_like(x0)
        
         t_idx = torch.randint(1, high=self.ts.size(0) - 1, size=(x0.size(0),))
@@ -166,12 +173,12 @@ class VDiffusion(nn.Module):
 
         do_scheduled_sampling = self.scheduled_sampling_weight_end > 0.0
         if do_scheduled_sampling:
-            z_t = self.scheduled_sampling_zt(net, x0, eps, t, t_idx, train_step, total_steps)
+            z_t = self.scheduled_sampling_zt(net, x0, eps, context, t, t_idx, train_step, total_steps)
         else:
             z_t = alpha * x0 + sigma * eps
 
         with torch.cuda.amp.autocast():
-            v_pred = net(z_t, t)
+            v_pred = net(z_t, t, context)
             y, target = self.get_loss_params(x0, eps, z_t, v_pred, t_idx)
 
             loss = F.mse_loss(y, target)
@@ -183,7 +190,6 @@ class VDiffusion(nn.Module):
 
         return loss
     
-
     def sample_clip(self, x0, clip_x0_pred_method, sigma: Optional[torch.tensor] == None):
         if clip_x0_pred_method == 'fixed':
             x0_clip = torch.clip(x0, -1, 1)
@@ -195,7 +201,6 @@ class VDiffusion(nn.Module):
         else:
             raise ValueError
         return x0_clip
-        
 
     @torch.no_grad()
     def sample(
@@ -203,6 +208,7 @@ class VDiffusion(nn.Module):
         net: nn.Module, 
         x0: torch.Tensor, 
         eps: Optional[torch.Tensor] = None,
+        context: Optional[torch.Tensor] = None,
         guide_with_frozen_channels: bool = True,
         # default overrides
         intermediates_every: Optional[int] = None,
@@ -254,7 +260,7 @@ class VDiffusion(nn.Module):
             alpha, sigma = t_to_alpha_sigma(t)
 
             with torch.cuda.amp.autocast():
-                v_pred = net(z_t, t)
+                v_pred = net(z_t, t, context)
                 x0_pred = alpha * z_t - sigma * v_pred
                 eps_pred = sigma * z_t + alpha * v_pred
 
