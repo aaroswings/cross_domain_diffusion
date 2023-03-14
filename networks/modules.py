@@ -1,17 +1,12 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from einops import repeat, rearrange
+from einops import repeat
+from einops.layers.torch import Rearrange
 
 import math
 from typing import List, Optional
-
-
-def zero_module(module):
-    for p in module.parameters():
-        p.detach().zero_()
-    return module
-
+from networks.util import zero_module
 
 class FourierFeatures(nn.Module):
     def __init__(self, out_features, std=16.):
@@ -62,25 +57,6 @@ class ScaleShiftNorm(nn.Module):
         x = x * (1 + scale) + shift
         x = self.actvn(x)
         return x
-    
-
-class SelfAttention2d(nn.Module):
-    def __init__(self, num_channels, num_heads=1):
-        super().__init__()
-        assert num_channels % num_heads == 0
-        self.n_head = num_heads
-        self.qkv_proj = nn.Conv2d(num_channels, num_channels * 3, 1)
-        self.out_proj = nn.Conv2d(num_channels, num_channels, 1)
-
-    def forward(self, input):
-        n, c, h, w = input.shape
-        qkv = self.qkv_proj(input)
-        qkv = qkv.view([n, self.n_head * 3, c // self.n_head, h * w]).transpose(2, 3)
-        q, k, v = qkv.chunk(3, dim=1)
-        scale = k.shape[3]**-0.25
-        att = ((q * scale) @ (k.transpose(2, 3) * scale)).softmax(3)
-        y = (att @ v).transpose(2, 3).contiguous().view([n, c, h, w])
-        return input + self.out_proj(y)
 
 
 class ResBlock(nn.Module):
@@ -194,7 +170,7 @@ def DownsampleRearrange(
     factor: int = 2
 ):
     return nn.Sequential(
-        rearrange('b c (h p1) (w p2) -> b (c p1 p2) h w', p1 = factor, p2 = factor),
+        Rearrange('b c (h p1) (w p2) -> b (c p1 p2) h w', p1 = factor, p2 = factor),
         nn.Conv2d(dim * (factor ** 2), dim_out or dim, 1)
     )
 

@@ -7,13 +7,17 @@ from typing import Tuple, Optional
 
 from networks.modules import (
     FourierFeatures, 
-    ResBlock, 
-    SelfAttention2d, 
+    ResBlock,
     MLPConv,
     UpsampleShuffle,
     DownsampleRearrange,
     Conv2DLayers, 
     Activations
+)
+
+from networks.attention import (
+    SpatialTransformer,
+    SelfAttention2d
 )
 
 @dataclass()
@@ -26,6 +30,8 @@ class UNetConfig:
     p_dropouts: Tuple[float] = (0, 0, 0, 0.1, 0.1)
     attn_heads: int = 4
     block_depth: Tuple[int] = (2, 4, 8, 16, 4)
+    crossattn_context: str = 'timestep' # or c_vector or none
+    context_dim: Optional[int] = None
     actvn_name: str = 'silu'
     conv2d_in_name: str = 'conv2d'
     conv2d_name: str = 'conv2d'
@@ -52,6 +58,16 @@ class UNet(nn.Module):
             nn.Linear(self.emb_dim, self.emb_dim)
         )
 
+        if self.crossattn_context == 'c_vector':
+            assert  self.context_dim is not None
+            self.c_embed_project = nn.Sequential(
+                nn.Linear(self.context_dim, self.emb_dim),
+                nn.SiLU(),
+                nn.Linear(self.emb_dim, self.emb_dim)
+            )
+
+
+
         self.embed_input = Conv2DLayers[self.conv2d_in_name](self.in_channels, self.channels[0], 3, padding=1, bias=False)
         self.project_output = nn.Sequential(
             nn.GroupNorm(32, self.channels[0]),
@@ -74,17 +90,26 @@ class UNet(nn.Module):
             
         self.down_blocks = nn.ModuleList(down_blocks)
 
+        self.attention = SpatialTransformer(
+            self.channels[-1],
+            self.attn_heads,
+            self.block_depth[-1],
+            self.p_dropouts[-1],
+            self.emb_dim
+        )
 
-        self.middle_mlp_blocks = nn.ModuleList([
-            MLPConv(self.channels[-1], 
-                    self.channels[-1], 
-                    self.emb_dim,
-                    self.p_dropouts[-1], 
-                    Conv2DLayers[self.conv2d_name], 
-                    Activations[self.actvn_name])
-            for _ in range(self.block_depth[-1])])
-        self.middle_attn_layers = nn.ModuleList([SelfAttention2d(self.channels[-1], self.attn_heads)
-            for _ in range(self.block_depth[-1])])
+
+        # self.middle_block = Tr
+        # self.middle_mlp_blocks = nn.ModuleList([
+        #     MLPConv(self.channels[-1], 
+        #             self.channels[-1], 
+        #             self.emb_dim,
+        #             self.p_dropouts[-1], 
+        #             Conv2DLayers[self.conv2d_name], 
+        #             Activations[self.actvn_name])
+        #     for _ in range(self.block_depth[-1])])
+        # self.middle_attn_layers = nn.ModuleList([SelfAttention2d(self.channels[-1], self.attn_heads)
+        #     for _ in range(self.block_depth[-1])])
 
         up_blocks = []
         for i in range(self.num_feature_map_sizes - 1):
@@ -110,13 +135,8 @@ class UNet(nn.Module):
         return next(self.parameters()).device
 
     def forward(self, x, t, c: Optional[torch.tensor] = None) -> torch.Tensor:
-        device = next(self.parameters()).device
-        x = x.to(device)
-        t = t.to(device)
-        if c is not None:
-            c = c.to(device)
-        emb = self.t_embed(t)
-        emb = self.t_project(emb)
+        t_embedded = self.t_embed(t)
+        t_embedded = self.t_project(t_embedded)
 
         h0 = self.embed_input(x)
         hs = []
@@ -124,14 +144,24 @@ class UNet(nn.Module):
 
         for down_block in self.down_blocks:
             for resblock in down_block[:-1]:
-                last_h = resblock(last_h, emb)
+                last_h = resblock(last_h, t_embedded)
                 hs.append(last_h)
             downsample = down_block[-1]
             last_h = downsample(last_h)
 
-        for mlp_block, attn_layer in zip(self.middle_mlp_blocks, self.middle_attn_layers):
-            last_h = mlp_block(last_h, emb)
-            last_h = attn_layer(last_h)
+        if self.crossattn_context == 'c_vector':
+            assert c is not None
+            c_embedded = self.c_embed_project(c)
+            last_h = self.attention(last_h, t_embedded)
+        elif self.crossattn_context == 'timestep':
+            last_h = self.attention(last_h, c_embedded)
+        elif self.crossattn_context == 'none':
+            last_h = self.attention(last_h, None)
+        
+
+        # for mlp_block, attn_layer in zip(self.middle_mlp_blocks, self.middle_attn_layers):
+        #     last_h = mlp_block(last_h, emb)
+        #     last_h = attn_layer(last_h)
 
         for up_block in self.up_blocks:
             upsample = up_block[0]
@@ -139,7 +169,7 @@ class UNet(nn.Module):
             for resblock in up_block[1:]:
                 skip_h = hs.pop()
                 last_h = (last_h + skip_h) / self.root2
-                last_h = resblock(last_h, emb)
+                last_h = resblock(last_h, t_embedded)
         
         last_h = self.project_output(last_h)
 
